@@ -8,6 +8,8 @@ require "stud/buffer"
 require "logstash/plugin_mixins/http_client"
 require "securerandom"
 
+require "logstash/filters/base"
+
 
 class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
   include LogStash::PluginMixins::HttpClient
@@ -48,25 +50,28 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
 
   config :host_resolve_ttl_sec, :validate => :number, :default => 120
 
+  config :workers, :type => :number, :default => 1
+  #config :workers => LogStash::SETTINGS.get("pipeline.workers")
+
   def print_plugin_info()
     @@plugins = Gem::Specification.find_all{|spec| spec.name =~ /logstash-output-clickhouse/ }
     @plugin_name = @@plugins[0].name
     @plugin_version = @@plugins[0].version
     @logger.info("Running #{@plugin_name} version #{@plugin_version}")
-
+    
     @logger.info("Initialized clickhouse with settings",
-      :flush_size => @flush_size,
+    :flush_size => @flush_size,
       :idle_flush_time => @idle_flush_time,
       :request_tokens => @pool_max,
       :http_hosts => @http_hosts,
       :http_query => @http_query,
       :headers => request_headers)
-  end
+    end
 
-  def register
+    def register
     # Handle this deprecated option. TODO: remove the option
     #@ssl_certificate_validation = @verify_ssl if @verify_ssl
-
+    
     # We count outstanding requests with this queue
     # This queue tracks the requests to create backpressure
     # When this queue is empty no new requests may be sent,
@@ -76,24 +81,72 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
     @requests = Array.new
     @http_query = "/?query=INSERT%20INTO%20#{table}%20FORMAT%20JSONEachRow"
     
-    @worker_clients = SizedQueue.new(self.workers)
-    @logger.info("ClickHouse output workers #{self.workers}")
-    self.workers {|t| @worker_clients << Manticore::Client.new }
+    #@logger.info("ClickHouse  :workers #{:workers}")
+    #@workers_num = LogStash::SETTINGS.get("pipeline.workers")
+    #@workers_num = safe_pipeline_worker_count()
 
+    #@worker_clients = SizedQueue.new(@workers_num)
+    #@logger.info("ClickHouse output workers #{@workers_num}")
+    #@workers_num {|t| @worker_clients.push(Manticore::Client.new) }
+    #@worker_client = Manticore::Client.new
+    #create_clients()
+    
     @hostnames_pool =
-      parse_http_hosts(http_hosts,
-        ShortNameResolver.new(ttl: @host_resolve_ttl_sec, logger: @logger))
-
+    parse_http_hosts(http_hosts,
+    ShortNameResolver.new(ttl: @host_resolve_ttl_sec, logger: @logger))
+    
     buffer_initialize(
       :max_items => @flush_size,
       :max_interval => @idle_flush_time,
       :logger => @logger
-    )
+      )
+      
+      print_plugin_info()
+    end # def register
+    
+    private
+    
+    def create_clients
+      @client0 = Manticore::Client.new
+      @client1 = Manticore::Client.new
+      @client2 = Manticore::Client.new
+      @client3 = Manticore::Client.new
+      @client4 = Manticore::Client.new
+      @worker_clients = SizedQueue.new(5)
+      @worker_clients.push(@client0)
+      @worker_clients.push(@client1)
+      @worker_clients.push(@client2)
+      @worker_clients.push(@client3)
+      @worker_clients.push(@client4)
+      @logger.info("client4 #{@client4.class}")
+      @logger.info("worker_clients #{@worker_clients.class}")
+      @logger.info("worker_clients_pop #{@worker_clients.pop().class}")
+    return @worker_clients
+  end #create_clients
 
-    print_plugin_info()
-  end # def register
+  def safe_pipeline_worker_count
+    default = settings.get_default("pipeline.workers")
+    pipeline_workers = settings.get("pipeline.workers") #override from args "-w 8" or config
+    safe_filters, unsafe_filters = filters.partition(&:threadsafe?)
+    plugins = unsafe_filters.collect { |f| f.config_name }
 
-  private
+    return pipeline_workers if unsafe_filters.empty?
+
+    if settings.set?("pipeline.workers")
+      if pipeline_workers > 1
+        @logger.warn("Warning: Manual override - there are filters that might not work with multiple worker threads", default_logging_keys(:worker_threads => pipeline_workers, :filters => plugins))
+      end
+    else
+      # user did not specify a worker thread count
+      # warn if the default is multiple
+      if default > 1
+        @logger.warn("Defaulting pipeline worker threads to 1 because there are some filters that might not work with multiple worker threads",
+                     default_logging_keys(:count_was => default, :filters => plugins))
+        return 1 # can't allow the default value to propagate if there are unsafe filters
+      end
+    end
+    pipeline_workers
+  end
 
   def parse_http_hosts(hosts, resolver)
     ip_re = /^[\d]+\.[\d]+\.[\d]+\.[\d]+$/
@@ -209,12 +262,16 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
 
     # Get client for this worker frm queue
     #worker_client = @worker_clients.pop
+
     worker_client = Manticore::Client.new
+    #@logger.info("worker_client0 #{@worker_client.class}")
+    #@logger.info("worker_clients #{@worker_clients.class}")
 
     # Create an async request
     begin
       #request = client.send(:post, url, :body => documents, :headers => request_headers, :async => true)
-      request = worker_client.parallel.post(url, :body => documents, :headers => request_headers, :async => true)
+      #request = @worker_client.parallel.post(url, :body => documents, :headers => request_headers, :async => true)
+      request = worker_client.post(url, :body => documents, :headers => request_headers)
     rescue Exception => e
       @logger.warn("An error occurred while indexing: #{e.message}")
     end
@@ -280,7 +337,7 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
     #client.execute!
     worker_client.execute!
     # Return client to queue
-    #@worker_clients << worker_client
+    #worker_clients.push(worker_client)
   end
 
   # This is split into a separate method mostly to help testing
