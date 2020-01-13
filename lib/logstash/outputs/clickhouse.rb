@@ -13,7 +13,8 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
   include LogStash::PluginMixins::HttpClient
   include Stud::Buffer
 
-  concurrency :single
+  #concurrency :single
+  concurrency :shared
 
   config_name "clickhouse"
 
@@ -74,6 +75,10 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
     @pool_max.times {|t| @request_tokens << true }
     @requests = Array.new
     @http_query = "/?query=INSERT%20INTO%20#{table}%20FORMAT%20JSONEachRow"
+    
+    @worker_clients = SizedQueue.new(self.workers)
+    @logger.info("ClickHouse output workers #{self.workers}")
+    self.workers {|t| @worker_clients << Manticore::Client.new }
 
     @hostnames_pool =
       parse_http_hosts(http_hosts,
@@ -122,9 +127,13 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
   end
 
   # This module currently does not support parallel requests as that would circumvent the batching
-  def receive(event)
-    buffer_receive(event)
-  end
+  #def receive(event)
+  #  buffer_receive(event)
+  #end
+
+  def multi_receive(events)
+    flush(events)
+  end # def multi_receive
 
   def mutate( src )
     return src if @mutations.empty?
@@ -198,9 +207,14 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
     token = @request_tokens.pop
     @logger.debug("Got token", :tokens => @request_tokens.length)
 
+    # Get client for this worker frm queue
+    #worker_client = @worker_clients.pop
+    worker_client = Manticore::Client.new
+
     # Create an async request
     begin
-      request = client.send(:post, url, :body => documents, :headers => request_headers, :async => true)
+      #request = client.send(:post, url, :body => documents, :headers => request_headers, :async => true)
+      request = worker_client.parallel.post(url, :body => documents, :headers => request_headers, :async => true)
     rescue Exception => e
       @logger.warn("An error occurred while indexing: #{e.message}")
     end
@@ -263,7 +277,10 @@ class LogStash::Outputs::ClickHouse < LogStash::Outputs::Base
       make_request(documents, hosts, query, con_count+1, req_count, host, uuid)
     end
 
-    client.execute!
+    #client.execute!
+    worker_client.execute!
+    # Return client to queue
+    #@worker_clients << worker_client
   end
 
   # This is split into a separate method mostly to help testing
